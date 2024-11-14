@@ -1,8 +1,11 @@
 package org.example.iotproject.Master.service.impl;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ghgande.j2mod.modbus.io.ModbusTCPTransaction;
 import com.ghgande.j2mod.modbus.msg.*;
 import com.ghgande.j2mod.modbus.net.TCPMasterConnection;
+import jakarta.annotation.PostConstruct;
 import org.example.iotproject.Address.entity.Address;
 import org.example.iotproject.Address.repository.AddressRepository;
 import org.example.iotproject.Device.entity.Device;
@@ -68,6 +71,7 @@ public class MasterServiceImpl implements MasterService {
             connectionStatus = "Connection Failed";
         }
 
+        publishConnectionStatus();
     }
 
     @Override
@@ -77,6 +81,7 @@ public class MasterServiceImpl implements MasterService {
                 connection.close();
                 connectionStatus = "Disconnected";
                 logger.info("Successfully disconnected from master PLC.");
+                publishConnectionStatus();
             } catch (Exception e) {
                 logger.error("Failed to disconnect from master PLC.", e);
             }
@@ -247,6 +252,7 @@ public class MasterServiceImpl implements MasterService {
             status.put("status", connectionStatus);
             status.put("timestamp", Instant.now());
             status.put("masterId", this.slaveId);
+            status.put("ipAddress", connection != null ? connection.getAddress().getHostAddress() : "Not Connected");
 
             logger.info("Publishing connection status: {}", status);
             mqttService.publish("plc/connection/status", status);
@@ -254,6 +260,7 @@ public class MasterServiceImpl implements MasterService {
             logger.error("Failed to publish connection status", e);
         }
     }
+
 
     private void publishBlowerStatus(boolean blowerStatus) {
         try {
@@ -271,12 +278,112 @@ public class MasterServiceImpl implements MasterService {
         }
     }
 
+    private int readHoldingRegister(int address) throws IOException {
+        try {
+            if (!connection.isConnected()) {
+                connection.connect();
+            }
+            ReadMultipleRegistersRequest req = new ReadMultipleRegistersRequest(address, 1);
+            req.setUnitID(slaveId);
+            ModbusResponse response = executeTransaction(req);
+
+            if (response instanceof ReadMultipleRegistersResponse) {
+                ReadMultipleRegistersResponse readResponse = (ReadMultipleRegistersResponse) response;
+                int value = readResponse.getRegisterValue(0);
+                logger.info("Successfully read from register {}: {}", address, value);
+                return value;
+            }
+            throw new IOException("Unexpected response type");
+        } catch (Exception e) {
+            logger.error("Error reading from register {}", address, e);
+            throw new IOException("Failed to read from register", e);
+        }
+    }
+
+    @Scheduled(fixedRate = 5000) // Read every 5 seconds
+    public void readAndPublishTemperature() {
+        try {
+            Optional<Address> addressOpt = addressRepository.findByAddressName("temperature_read");
+            if (addressOpt.isEmpty()) {
+                logger.error("Temperature read address not found");
+                return;
+            }
+
+            int modbusAddress = addressOpt.get().getModbusAddress();
+            int temperature = readHoldingRegister(modbusAddress);
+
+            // Publish to MQTT
+            Map<String, Object> temperatureData = new HashMap<>();
+            temperatureData.put("value", temperature);
+            temperatureData.put("timestamp", Instant.now());
+            temperatureData.put("deviceId", "Temperature_Sensor");
+            temperatureData.put("masterId", this.slaveId);
+
+            mqttService.publish("plc/temperature/value", temperatureData);
+            logger.info("Published temperature value: {}", temperature);
+
+        } catch (Exception e) {
+            logger.error("Failed to read temperature", e);
+        }
+    }
+
 
     private ModbusResponse executeTransaction(ModbusRequest request) throws Exception {
         ModbusTCPTransaction transaction = new ModbusTCPTransaction(connection);
         transaction.setRequest(request);
         transaction.execute();
         return transaction.getResponse();
+    }
+
+    @PostConstruct
+    public void subscribeToCommands() {
+        try {
+            // Subscribe to blower commands
+            mqttService.subscribe("plc/commands/blower", (topic, message) -> {
+                try {
+                    JsonNode command = new ObjectMapper().readTree(new String(message.getPayload()));
+                    String action = command.get("action").asText();
+
+                    logger.info("Received blower command: {}", action);
+
+                    switch (action) {
+                        case "TURN_ON_BLOWER":
+                            turnOnBlower1();
+                            break;
+                        case "TURN_OFF_BLOWER":
+                            turnOffBlower1();
+                            break;
+                        default:
+                            logger.warn("Unknown blower command: {}", action);
+                    }
+                } catch (Exception e) {
+                    logger.error("Error processing blower command", e);
+                }
+            });
+
+            // Subscribe to connection commands
+            mqttService.subscribe("plc/commands/connect", (topic, message) -> {
+                try {
+                    JsonNode command = new ObjectMapper().readTree(new String(message.getPayload()));
+                    String action = command.get("action").asText();
+
+                    if ("CONNECT".equals(action)) {
+                        String ipAddress = command.get("ipAddress").asText();
+                        logger.info("Received connect command for IP: {}", ipAddress);
+                        connectToMaster(ipAddress);
+                    } else if ("DISCONNECT".equals(action)) {
+                        logger.info("Received disconnect command");
+                        disconnectFromMaster();
+                    }
+                } catch (Exception e) {
+                    logger.error("Error processing connection command", e);
+                }
+            });
+
+            logger.info("Successfully subscribed to command topics");
+        } catch (Exception e) {
+            logger.error("Failed to subscribe to command topics", e);
+        }
     }
 }
 
