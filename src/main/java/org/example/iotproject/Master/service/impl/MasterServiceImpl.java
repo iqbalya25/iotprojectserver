@@ -261,7 +261,6 @@ public class MasterServiceImpl implements MasterService {
         }
     }
 
-
     private void publishBlowerStatus(boolean blowerStatus) {
         try {
             logger.info("Preparing to publish blower status to MQTT");
@@ -367,11 +366,11 @@ public class MasterServiceImpl implements MasterService {
                     JsonNode command = new ObjectMapper().readTree(new String(message.getPayload()));
                     String action = command.get("action").asText();
 
-                    if ("CONNECT".equals(action)) {
+                    if ("CONNECT_MASTER".equals(action)) {
                         String ipAddress = command.get("ipAddress").asText();
                         logger.info("Received connect command for IP: {}", ipAddress);
                         connectToMaster(ipAddress);
-                    } else if ("DISCONNECT".equals(action)) {
+                    } else if ("DISCONNECT_MASTER".equals(action)) {
                         logger.info("Received disconnect command");
                         disconnectFromMaster();
                     }
