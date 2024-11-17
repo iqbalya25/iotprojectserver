@@ -1,5 +1,6 @@
 package org.example.iotproject.Master.service.impl;
 
+import aj.org.objectweb.asm.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ghgande.j2mod.modbus.io.ModbusTCPTransaction;
@@ -91,7 +92,7 @@ public class MasterServiceImpl implements MasterService {
     }
 
     private void executeCommand(String addressName, Boolean isOnCommand ) throws Exception {
-        if (connectionStatus == "Connection Failed" || connectionStatus == "Disconnected")   {
+        if ("Connection Failed".equals(connectionStatus) || "Disconnected".equals(connectionStatus))   {
             throw new Exception("Connection Failed");
         }
 
@@ -106,7 +107,7 @@ public class MasterServiceImpl implements MasterService {
     }
 
     private Boolean getStatus(String addressName) throws Exception {
-        if (connectionStatus == "Connection Failed" || connectionStatus == "Disconnected")   {
+        if ("Connection Failed".equals(connectionStatus) || "Disconnected".equals(connectionStatus))   {
             throw new Exception("Connection Failed");
         }
 
@@ -337,51 +338,70 @@ public class MasterServiceImpl implements MasterService {
     @PostConstruct
     public void subscribeToCommands() {
         try {
-            // Subscribe to blower commands
-            mqttService.subscribe("plc/commands/blower", (topic, message) -> {
-                try {
-                    JsonNode command = new ObjectMapper().readTree(new String(message.getPayload()));
-                    String action = command.get("action").asText();
+            logger.info("Starting to subscribe to MQTT commands...");
 
-                    logger.info("Received blower command: {}", action);
+            // Add connection test
+            if (mqttService == null) {
+                logger.error("MQTT Service is null!");
+                return;
+            }
 
-                    switch (action) {
-                        case "TURN_ON_BLOWER":
-                            turnOnBlower1();
-                            break;
-                        case "TURN_OFF_BLOWER":
-                            turnOffBlower1();
-                            break;
-                        default:
-                            logger.warn("Unknown blower command: {}", action);
-                    }
-                } catch (Exception e) {
-                    logger.error("Error processing blower command", e);
-                }
-            });
-
-            // Subscribe to connection commands
+            // Connection Commands Subscription
             mqttService.subscribe("plc/commands/connect", (topic, message) -> {
+                logger.info("Received message on topic {}: {}", topic, new String(message.getPayload()));
                 try {
-                    JsonNode command = new ObjectMapper().readTree(new String(message.getPayload()));
-                    String action = command.get("action").asText();
+                    Map<String, Object> command = new ObjectMapper().readValue(
+                            new String(message.getPayload()),
+                            HashMap.class
+                    );
+                    String action = (String) command.get("action");
+                    logger.info("Parsed connection command: {}", command);
 
                     if ("CONNECT_MASTER".equals(action)) {
-                        String ipAddress = command.get("ipAddress").asText();
-                        logger.info("Received connect command for IP: {}", ipAddress);
+                        String ipAddress = (String) command.get("ipAddress");
+                        logger.info("Attempting to connect to master at IP: {}", ipAddress);
                         connectToMaster(ipAddress);
-                    } else if ("DISCONNECT_MASTER".equals(action)) {
-                        logger.info("Received disconnect command");
+                        logger.info("Connection attempt completed");
+                    }
+                    else if ("DISCONNECT_MASTER".equals(action)) {
+                        logger.info("Attempting to disconnect from master");
                         disconnectFromMaster();
+                        logger.info("Disconnect attempt completed");
                     }
                 } catch (Exception e) {
-                    logger.error("Error processing connection command", e);
+                    logger.error("Error processing connection command: {}", e.getMessage(), e);
                 }
             });
 
-            logger.info("Successfully subscribed to command topics");
+            // Blower Commands Subscription
+            mqttService.subscribe("plc/commands/blower", (topic, message) -> {
+                logger.info("Received message on topic {}: {}", topic, new String(message.getPayload()));
+                try {
+                    Map<String, Object> command = new ObjectMapper().readValue(
+                            new String(message.getPayload()),
+                            HashMap.class
+                    );
+                    String action = (String) command.get("action");
+                    logger.info("Parsed blower command: {}", command);
+
+                    if ("TURN_ON_BLOWER".equals(action)) {
+                        logger.info("Starting turn on blower sequence");
+                        turnOnBlower1();
+                        logger.info("Blower turn on sequence completed");
+                    }
+                    else if ("TURN_OFF_BLOWER".equals(action)) {
+                        logger.info("Starting turn off blower sequence");
+                        turnOffBlower1();
+                        logger.info("Blower turn off sequence completed");
+                    }
+                } catch (Exception e) {
+                    logger.error("Error processing blower command: {}", e.getMessage(), e);
+                }
+            });
+
+            logger.info("Successfully subscribed to all command topics");
         } catch (Exception e) {
-            logger.error("Failed to subscribe to command topics", e);
+            logger.error("Failed to setup command subscriptions: {}", e.getMessage(), e);
         }
     }
 }
