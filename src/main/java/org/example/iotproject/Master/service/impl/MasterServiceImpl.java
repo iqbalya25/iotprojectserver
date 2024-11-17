@@ -33,6 +33,7 @@ public class MasterServiceImpl implements MasterService {
     private static final Logger logger = (Logger) LoggerFactory.getLogger(MasterServiceImpl.class);
     private static final int PULSE_DURATION_MS = 100;
     private String connectionStatus = "disconnected";
+    private boolean manuallyDisconnected = true;
 
     private final AddressRepository addressRepository;
     private final MasterRepository masterRepository;
@@ -52,6 +53,7 @@ public class MasterServiceImpl implements MasterService {
 
     @Override
     public void connectToMaster(String masterIpAddress) throws Exception {
+        manuallyDisconnected = false;
         Optional<Master> plcMaster = masterRepository.findByMasterIpAddress(masterIpAddress);
         if (plcMaster.isEmpty()) {
             throw new Exception("PLC Master configuration not found for " + masterIpAddress);
@@ -66,7 +68,7 @@ public class MasterServiceImpl implements MasterService {
 
         if (!connection.isConnected()) {
             connection.connect();
-            logger.info(master.getMasterIpAddress(), master.getMasterPort());
+            logger.info("Connected to {}:{}", master.getMasterIpAddress(), master.getMasterPort());
             connectionStatus = "Connected";
         } else {
             connectionStatus = "Connection Failed";
@@ -81,6 +83,7 @@ public class MasterServiceImpl implements MasterService {
             try {
                 connection.close();
                 connectionStatus = "Disconnected";
+                manuallyDisconnected = true;
                 logger.info("Successfully disconnected from master PLC.");
                 publishConnectionStatus();
             } catch (Exception e) {
@@ -88,6 +91,19 @@ public class MasterServiceImpl implements MasterService {
             }
         } else {
             logger.warn("Attempted to disconnect, but no active connection was found.");
+        }
+    }
+
+    private boolean isConnectedAndReady() {
+        return connection != null
+                && connection.isConnected()
+                && "Connected".equals(connectionStatus)
+                && !manuallyDisconnected;
+    }
+
+    private void checkConnection() throws Exception {
+        if (!isConnectedAndReady()) {
+            throw new Exception("PLC not connected. Current status: " + connectionStatus);
         }
     }
 
@@ -124,24 +140,24 @@ public class MasterServiceImpl implements MasterService {
 
     @Override
     public void turnOnBlower1() throws Exception {
+        checkConnection();
         executeCommand("Blower_1_On", true);
         boolean status = getStatus("Blower_1_Status");
         publishBlowerStatus(status);
     }
 
-
-
     @Override
     public void turnOffBlower1() throws Exception {
+        checkConnection();
         executeCommand("Blower_1_Off", false);
         boolean status = getStatus("Blower_1_Status");
         publishBlowerStatus(status);
     }
 
     @Override
-    public boolean getBlower1Status()  throws Exception{
-        boolean status = getStatus("Blower_1_Status");
-        return status;
+    public boolean getBlower1Status() throws Exception {
+        checkConnection();
+        return getStatus("Blower_1_Status");
     }
 
     private void sendMomentaryPulse(int coil , Boolean isOnCommand) throws IOException {
@@ -159,7 +175,7 @@ public class MasterServiceImpl implements MasterService {
 
     private void writeCoil(int coil, boolean state, Boolean isOnCommand) throws IOException {
         try {
-            if (!connection.isConnected()) {
+            if (!connection.isConnected()  && !manuallyDisconnected) {
                 connection.connect();
             }
             WriteCoilRequest req = new WriteCoilRequest(coil, state);
@@ -190,7 +206,7 @@ public class MasterServiceImpl implements MasterService {
 
     private boolean readCoil(int coil) throws IOException {
         try {
-            if (!connection.isConnected()) {
+            if (!connection.isConnected()  && !manuallyDisconnected) {
                 connection.connect();
             }
             ReadCoilsRequest req = new ReadCoilsRequest(coil, 1);
@@ -212,38 +228,35 @@ public class MasterServiceImpl implements MasterService {
 
     @Scheduled(fixedRate = 5000)
     public void checkConnectionStatus() {
-        if (connection != null) {
+        // Only check if we're supposed to be connected
+        if (!manuallyDisconnected && connection != null) {
             try {
                 Optional<Address> connectionCheckAddress = addressRepository.findByAddressName("Connection_Check");
                 if (connectionCheckAddress.isEmpty()) {
-                    logger.error("Connection_Check address not found in database");
                     connectionStatus = "Configuration Error";
+                    publishConnectionStatus();
                     return;
                 }
 
-                int modbusAddress = connectionCheckAddress.get().getModbusAddress();
-
-                if (connection.isConnected()) {
-                    // Just try to read the address - if it succeeds, connection is good
-                    ReadCoilsRequest req = new ReadCoilsRequest(modbusAddress, 1);
-                    req.setUnitID(slaveId);
-                    ModbusResponse response = executeTransaction(req);
-
-                    // If we get here, read was successful
-                    connectionStatus = "Connected";
-                    logger.info("Successfully read from PLC address {}", modbusAddress);
-                } else {
+                if (!connection.isConnected()) {
                     connectionStatus = "Disconnected";
-                    logger.warn("Modbus connection lost");
+                    publishConnectionStatus();
+                    return;
                 }
+
+                // Try to read from PLC to verify connection
+                int modbusAddress = connectionCheckAddress.get().getModbusAddress();
+                ReadCoilsRequest req = new ReadCoilsRequest(modbusAddress, 1);
+                req.setUnitID(slaveId);
+                executeTransaction(req);
+
+                connectionStatus = "Connected";
             } catch (Exception e) {
                 connectionStatus = "Connection Failed";
                 logger.error("Failed to read from PLC: {}", e.getMessage());
             }
-        } else {
-            connectionStatus = "Not Initialized";
+            publishConnectionStatus();
         }
-        publishConnectionStatus();
     }
 
     private void publishConnectionStatus() {
@@ -280,7 +293,7 @@ public class MasterServiceImpl implements MasterService {
 
     private int readHoldingRegister(int address) throws IOException {
         try {
-            if (!connection.isConnected()) {
+            if (!connection.isConnected()  && !manuallyDisconnected) {
                 connection.connect();
             }
             ReadMultipleRegistersRequest req = new ReadMultipleRegistersRequest(address, 1);
@@ -300,9 +313,13 @@ public class MasterServiceImpl implements MasterService {
         }
     }
 
-    @Scheduled(fixedRate = 5000) // Read every 5 seconds
+    @Scheduled(fixedRate = 5000)
     public void readAndPublishTemperature() {
         try {
+            if (!isConnectedAndReady()) {
+                return;
+            }
+
             Optional<Address> addressOpt = addressRepository.findByAddressName("temperature_read");
             if (addressOpt.isEmpty()) {
                 logger.error("Temperature read address not found");
@@ -312,7 +329,6 @@ public class MasterServiceImpl implements MasterService {
             int modbusAddress = addressOpt.get().getModbusAddress();
             int temperature = readHoldingRegister(modbusAddress);
 
-            // Publish to MQTT
             Map<String, Object> temperatureData = new HashMap<>();
             temperatureData.put("value", temperature);
             temperatureData.put("timestamp", Instant.now());
