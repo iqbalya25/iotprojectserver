@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ghgande.j2mod.modbus.io.ModbusTCPTransaction;
 import com.ghgande.j2mod.modbus.msg.*;
 import com.ghgande.j2mod.modbus.net.TCPMasterConnection;
+import com.ghgande.j2mod.modbus.procimg.SimpleRegister;
 import jakarta.annotation.PostConstruct;
 import org.example.iotproject.Address.entity.Address;
 import org.example.iotproject.Address.repository.AddressRepository;
@@ -419,6 +420,115 @@ public class MasterServiceImpl implements MasterService {
         } catch (Exception e) {
             logger.error("Failed to setup command subscriptions: {}", e.getMessage(), e);
         }
+    }
+
+    // Add these methods to MasterServiceImpl.java in the first backend
+
+    private int readHoldingRegisterByName(String addressName) throws Exception {
+        Optional<Address> addressOpt = addressRepository.findByAddressName(addressName);
+        if (addressOpt.isEmpty()) {
+            logger.error("Address {} not found in database", addressName);
+            throw new IOException("Address not found in database");
+        }
+
+        int modbusAddress = addressOpt.get().getModbusAddress();
+        try {
+            if (!connection.isConnected() && !manuallyDisconnected) {
+                connection.connect();
+            }
+            ReadMultipleRegistersRequest req = new ReadMultipleRegistersRequest(modbusAddress, 1);
+            req.setUnitID(slaveId);
+            ModbusResponse response = executeTransaction(req);
+
+            if (response instanceof ReadMultipleRegistersResponse) {
+                ReadMultipleRegistersResponse readResponse = (ReadMultipleRegistersResponse) response;
+                int value = readResponse.getRegisterValue(0);
+                logger.info("Successfully read {} value: {}", addressName, value);
+                return value;
+            }
+            throw new IOException("Unexpected response type");
+        } catch (Exception e) {
+            logger.error("Error reading {} value", addressName, e);
+            throw new IOException("Failed to read register", e);
+        }
+    }
+
+    private void writeHoldingRegisterByName(String addressName, int value) throws Exception {
+        Optional<Address> addressOpt = addressRepository.findByAddressName(addressName);
+        if (addressOpt.isEmpty()) {
+            logger.error("Address {} not found in database", addressName);
+            throw new IOException("Address not found in database");
+        }
+
+        int modbusAddress = addressOpt.get().getModbusAddress();
+        try {
+            if (!connection.isConnected() && !manuallyDisconnected) {
+                connection.connect();
+            }
+
+            // Create a Register with the value
+            SimpleRegister register = new SimpleRegister(value);
+            WriteSingleRegisterRequest req = new WriteSingleRegisterRequest(modbusAddress, register);
+            req.setUnitID(slaveId);
+            ModbusResponse response = executeTransaction(req);
+
+            if (!(response instanceof WriteSingleRegisterResponse)) {
+                throw new IOException("Unexpected response type");
+            }
+            logger.info("Successfully wrote value {} to {}", value, addressName);
+        } catch (Exception e) {
+            logger.error("Error writing to {}", addressName, e);
+            throw new IOException("Failed to write to register", e);
+        }
+    }
+
+    @Scheduled(fixedRate = 1000)
+    public void readAndPublishBlowerParameters() {
+        try {
+            if (!isConnectedAndReady()) {
+                return;
+            }
+
+            // Read all blower parameters
+            int frequency = readHoldingRegisterByName("blower_frequency_read");
+            int ampere = readHoldingRegisterByName("blower_ampere_read");
+            int voltage = readHoldingRegisterByName("blower_voltage_read");
+
+            Map<String, Object> blowerData = new HashMap<>();
+            blowerData.put("frequency", frequency);
+            blowerData.put("ampere", ampere);
+            blowerData.put("voltage", voltage);
+            blowerData.put("timestamp", Instant.now());
+            blowerData.put("deviceId", "Blower_1");
+            blowerData.put("masterId", this.slaveId);
+
+            mqttService.publish("plc/blower/parameters", blowerData);
+            logger.info("Published blower parameters: {}", blowerData);
+
+        } catch (Exception e) {
+            logger.error("Failed to read blower parameters", e);
+        }
+    }
+
+    @PostConstruct
+    public void subscribeToBlowerCommands() {
+        // Add this to your existing subscribeToCommands method
+        mqttService.subscribe("plc/commands/blower/frequency", (topic, message) -> {
+            try {
+                Map<String, Object> command = new ObjectMapper().readValue(
+                        new String(message.getPayload()),
+                        HashMap.class
+                );
+
+                Integer frequency = (Integer) command.get("frequency");
+                if (frequency != null) {
+                    writeHoldingRegisterByName("blower_frequency_set", frequency);
+                    logger.info("Set blower frequency to: {}", frequency);
+                }
+            } catch (Exception e) {
+                logger.error("Error processing blower frequency command", e);
+            }
+        });
     }
 }
 
